@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Digital Scout | Enterprise UI</title>
+    <style>
+        :root {
+            --bg-base: #0f172a;
+            --bg-panel: #1e293b;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --accent-blue: #3b82f6;
+            --accent-green: #10b981;
+            --accent-red: #ef4444;
+            --accent-purple: #8b5cf6;
+            --border-color: #334155;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        
+        body { background-color: var(--bg-base); color: var(--text-main); height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+        /* Header */
+        header { padding: 1rem 2rem; background-color: var(--bg-panel); border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center; }
+        header h1 { font-size: 1.2rem; font-weight: 600; letter-spacing: 1px; display: flex; align-items: center; gap: 10px; }
+        .status-badge { background: rgba(16, 185, 129, 0.2); color: var(--accent-green); padding: 4px 12px; border-radius: 20px; font-size: 0.8rem; font-weight: bold; border: 1px solid var(--accent-green); }
+        .status-badge.offline { background: rgba(239, 68, 68, 0.2); color: var(--accent-red); border-color: var(--accent-red); }
+
+        /* Grid Layout */
+        .dashboard-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; padding: 1rem; height: calc(100vh - 65px); }
+        
+        .panel { background-color: var(--bg-panel); border-radius: 8px; border: 1px solid var(--border-color); display: flex; flex-direction: column; overflow: hidden; }
+        .panel-header { padding: 0.75rem 1rem; border-bottom: 1px solid var(--border-color); background: rgba(0,0,0,0.2); font-weight: 600; font-size: 0.9rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; }
+        .panel-content { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 0.8rem; }
+
+        /* Chat UI */
+        .msg { max-width: 85%; padding: 10px 14px; border-radius: 8px; font-size: 0.95rem; line-height: 1.4; animation: fadeIn 0.3s ease; }
+        .msg.parent { align-self: flex-start; background-color: #334155; border-bottom-left-radius: 2px; }
+        .msg.ai { align-self: flex-end; background-color: var(--accent-blue); border-bottom-right-radius: 2px; }
+        
+        /* System Logs */
+        .log-entry { font-family: 'Courier New', Courier, monospace; font-size: 0.85rem; padding: 6px; border-radius: 4px; border-left: 3px solid var(--text-muted); background: rgba(255,255,255,0.03); }
+        .log-entry.success { border-left-color: var(--accent-green); color: #a7f3d0; }
+        .log-entry.error { border-left-color: var(--accent-red); color: #fecaca; }
+        .log-entry.action { border-left-color: var(--accent-purple); color: #ddd6fe; }
+
+        /* Database Table */
+        table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid var(--border-color); }
+        th { color: var(--text-muted); font-weight: 600; text-transform: uppercase; font-size: 0.8rem; }
+        tr:hover { background-color: rgba(255,255,255,0.02); }
+        .status-paid { color: var(--accent-green); font-weight: bold; background: rgba(16,185,129,0.1); padding: 2px 8px; border-radius: 4px; }
+        .status-unpaid { color: var(--accent-red); font-weight: bold; background: rgba(239,68,68,0.1); padding: 2px 8px; border-radius: 4px; }
+
+        /* Scrollbars */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #475569; border-radius: 10px; }
+
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1>☁️ Digital Scout <span style="color:var(--text-muted); font-size:0.9rem; font-weight:normal;">| Enterprise Command Center</span></h1>
+        <div id="connection-status" class="status-badge offline">CONNECTING TO RELAY...</div>
+    </header>
+
+    <div class="dashboard-grid">
+        
+        <div class="panel">
+            <div class="panel-header">💾 Live Local Database (Shadow Copy)</div>
+            <div class="panel-content" style="padding: 0;">
+                <table id="db-table">
+                    <thead>
+                        <tr id="db-headers"><th>Awaiting Data...</th></tr>
+                    </thead>
+                    <tbody id="db-body">
+                        </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header">🤖 Agent Intelligence Feed</div>
+            <div class="panel-content" id="chat-box">
+                <div style="text-align:center; color:var(--text-muted); font-size:0.85rem; margin-top:20px;">
+                    Listening for incoming messages...
+                </div>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header">🛡️ Zero-Trust Audit Log</div>
+            <div class="panel-content" id="log-box">
+                </div>
+        </div>
+
+    </div>
+
+    <script>
+        const ws = new WebSocket('ws://localhost:8080');
+        const statusBadge = document.getElementById('connection-status');
+        const chatBox = document.getElementById('chat-box');
+        const logBox = document.getElementById('log-box');
+        const dbHeaders = document.getElementById('db-headers');
+        const dbBody = document.getElementById('db-body');
+
+        ws.onopen = () => {
+            statusBadge.textContent = 'CLOUD UPLINK SECURE';
+            statusBadge.classList.remove('offline');
+            ws.send(JSON.stringify({ role: 'dashboard' }));
+            addLog('SYSTEM', 'Connected to Cloud Relay.', 'success');
+        };
+
+        ws.onclose = () => {
+            statusBadge.textContent = 'CONNECTION LOST';
+            statusBadge.classList.add('offline');
+            addLog('ERROR', 'Connection to Cloud Relay severed.', 'error');
+        };
+
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            
+            switch (data.type) {
+                case 'user_msg':
+                    addChatMessage(data.message, 'parent');
+                    break;
+                case 'ai_reply':
+                    addChatMessage(data.message, 'ai');
+                    break;
+                case 'system':
+                    addLog('INFO', data.message);
+                    break;
+                case 'system_success':
+                    addLog('EDGE CONFIRM', data.message, 'success');
+                    break;
+                case 'system_error':
+                    addLog('CRITICAL', data.message, 'error');
+                    break;
+                case 'ai_action':
+                    addLog('AI MUTATION', `${data.message} ${JSON.stringify(data.data)}`, 'action');
+                    break;
+                
+                // 🛡️ NEW: The Action Lock UI Trigger
+                case 'ai_action_locked':
+                    addLog('ACTION LOCKED', data.message, 'error'); 
+                    
+                    const lockDiv = document.createElement('div');
+                    lockDiv.className = `msg ai`;
+                    lockDiv.style.backgroundColor = 'var(--accent-red)';
+                    lockDiv.innerHTML = `
+                        <strong>🔒 ACTION BLOCKED</strong><br>
+                        AI requested to change <b>${data.data.target}</b> to <b>${data.data.status}</b>.<br><br>
+                        <button onclick="approveAction('${data.data.lockId}', this)" style="background:#fff; color:#000; border:none; padding:5px 10px; border-radius:4px; cursor:pointer; font-weight:bold;">APPROVE WRITE</button>
+                    `;
+                    chatBox.appendChild(lockDiv);
+                    chatBox.scrollTop = chatBox.scrollHeight;
+                    break;
+
+                case 'database':
+                    renderTable(data.data);
+                    addLog('SYNC', 'Shadow Database updated from Edge Node.', 'success');
+                    break;
+            }
+        };
+
+        // 🛡️ NEW: Function to send the human approval back to the Node server
+        function approveAction(lockId, buttonElement) {
+            ws.send(JSON.stringify({ role: 'dashboard_approval', lock_id: lockId }));
+            addLog('HUMAN OVERRIDE', `Admin approved execution for ${lockId}`, 'success');
+            
+            // Visual feedback on the button
+            buttonElement.disabled = true;
+            buttonElement.textContent = "✅ APPROVED";
+            buttonElement.style.opacity = "0.7";
+            buttonElement.style.cursor = "default";
+        }
+
+        function addChatMessage(text, sender) {
+            if(chatBox.children.length === 1 && chatBox.children[0].tagName === 'DIV') chatBox.innerHTML = '';
+            const msgDiv = document.createElement('div');
+            msgDiv.className = `msg ${sender}`;
+            msgDiv.textContent = text;
+            chatBox.appendChild(msgDiv);
+            chatBox.scrollTop = chatBox.scrollHeight; 
+        }
+
+        function addLog(prefix, message, level = '') {
+            const logDiv = document.createElement('div');
+            logDiv.className = `log-entry ${level}`;
+            const time = new Date().toLocaleTimeString();
+            logDiv.textContent = `[${time}] [${prefix}] ${message}`;
+            logBox.appendChild(logDiv);
+            logBox.scrollTop = logBox.scrollHeight; 
+        }
+
+        function renderTable(records) {
+            if (!records || records.length === 0) return;
+            const keys = Object.keys(records[0]);
+            dbHeaders.innerHTML = keys.map(key => `<th>${key}</th>`).join('');
+            dbBody.innerHTML = records.map(row => {
+                const cells = keys.map(key => {
+                    let val = row[key];
+                    if (key.toLowerCase() === 'status') {
+                        if(val === 'Paid') return `<td><span class="status-paid">${val}</span></td>`;
+                        if(val === 'Unpaid') return `<td><span class="status-unpaid">${val}</span></td>`;
+                    }
+                    return `<td>${val}</td>`;
+                }).join('');
+                return `<tr>${cells}</tr>`;
+            }).join('');
+        }
+    </script>
+</body>
+</html>
