@@ -1,0 +1,17 @@
+{
+  "DigitalScout_Live_xyz123": {
+    "business_name": "Test Gym (Local)",
+    "tier": "free_pilot",
+    "status": "active"
+  },
+  "Ranchi_Fitness_Pro_9988": {
+    "business_name": "Ranchi Fitness Pro",
+    "tier": "enterprise",
+    "status": "active"
+  },
+  "Apex_Coaching_Center_7766": {
+    "business_name": "Apex Coaching Center",
+    "tier": "enterprise",
+    "status": "suspended"
+  }
+}

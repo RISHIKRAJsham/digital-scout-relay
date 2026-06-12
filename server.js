@@ -3,11 +3,14 @@ const readline = require('readline');
 const sessionManager = require('./sessionManager');
 const cacheService = require('./cacheService');
 
+// 👇 ADDED: The master ledger for all gym clients
+const clientsDatabase = require('./clients.json'); 
+
 // ============================================================================
 // 🧠 SECURITY KEYS & ENVIRONMENT SETUP
 // ============================================================================
 const API_KEY = "AIzaSyCo4dMg9oHn5U-roqeia_joEEloPOhtOF0"; 
-const EDGE_AGENT_TOKEN = "DigitalScout_Live_xyz123";      
+// Note: EDGE_AGENT_TOKEN is removed. We now verify dynamically via clients.json
 const EXTERNAL_AI_TOKEN = "Bearer mcp_sk_live_9988776655";  
 
 // 🛡️ NEW: Strict Origin Whitelist for the External AI Agent
@@ -18,6 +21,7 @@ const PORT = process.env.PORT || 8081;
 const wss = new WebSocket.Server({ port: PORT });
 
 let activeAgent = null;
+let activeClientToken = null; // Tracks which client the terminal simulator is currently talking to
 let dashboardClients = []; 
 let pendingQuestion = ""; 
 
@@ -59,14 +63,11 @@ function broadcastToUI(type, message, data = null) {
 // ============================================================================
 wss.on('connection', function connection(ws, req) {
   
-  // Extract the exact IP address of the incoming connection
   const clientIp = req.socket.remoteAddress;
 
   if (req.url === '/agent-tunnel') {
-      console.log("✅ SUCCESS: The local offline agent is connected! The tunnel is live.");
-      activeAgent = ws;
-      broadcastToUI("system", "C++ Edge Agent connected.");
-      promptWhatsApp();
+      // The edge node connected, but it hasn't authenticated yet. We wait for its first message.
+      activeAgent = ws; 
   }
 
   ws.on('message', async function incoming(message) {
@@ -81,7 +82,7 @@ wss.on('connection', function connection(ws, req) {
             
             activeAgent.send(JSON.stringify({ 
                 action: approvedCommand.action_type || "update_data", 
-                auth_token: EDGE_AGENT_TOKEN, 
+                auth_token: activeClientToken, // Pass the active token dynamically
                 payload: approvedCommand.payload, 
                 mcp_request_id: approvedCommand.mcp_request_id 
             }));
@@ -98,26 +99,35 @@ wss.on('connection', function connection(ws, req) {
         return;
     }
 
-    const isLocalEdge = (payload.auth_token === EDGE_AGENT_TOKEN) || (ws === activeAgent);
+    // 👇 UPGRADED: Dynamic Client Authentication
+    const clientData = clientsDatabase[payload.auth_token];
+    const isLocalEdge = clientData && clientData.status === "active";
+    
+    // If this is the initial auth ping from a new edge node connection
+    if (isLocalEdge && payload.action === undefined && !payload.status) {
+         console.log(`✅ [AUTH SUCCESS]: Edge Node connected for -> ${clientData.business_name}`);
+         activeClientToken = payload.auth_token; 
+         broadcastToUI("system", `C++ Edge Agent connected for ${clientData.business_name}.`);
+         promptWhatsApp();
+    }
+
     const isExternalAgent = (payload.headers && payload.headers.Authorization === EXTERNAL_AI_TOKEN);
 
     // 🛡️ THE UPGRADED ZERO-TRUST FIREWALL
-    if (!isLocalEdge && !isExternalAgent) { 
-        ws.send(JSON.stringify({ error: "Unauthorized Token." })); 
+    if (!isLocalEdge && !isExternalAgent && activeAgent !== ws) { 
+        console.log(`🚨 [AUTH FAILED]: Rejected invalid or suspended token -> ${payload.auth_token}`);
+        ws.send(JSON.stringify({ error: "Unauthorized or Suspended Token." })); 
         ws.close(); 
         return; 
     }
 
     if (isExternalAgent) {
-        // Multi-Factor Check: Is this stolen token coming from a hacker's IP?
         if (!AUTHORIZED_AI_IPS.has(clientIp)) {
             console.log(`🚨 [SECURITY BREACH DETECTED]: Valid token used from unauthorized IP: ${clientIp}`);
             ws.send(JSON.stringify({ error: "Unauthorized Origin IP." })); 
             ws.close(); 
             return;
         }
-        
-        // Multi-Factor Check: Rate limit THIS specific IP
         if (!checkRateLimit(clientIp)) { 
             ws.send(JSON.stringify({ error: "Rate limit exceeded for this IP." })); 
             return; 
@@ -129,7 +139,6 @@ wss.on('connection', function connection(ws, req) {
     // ========================================================================
     if (payload.jsonrpc === "2.0") {
         
-        // 1. SCHEMA DISCOVERY
         if (payload.method === "tools/list") {
             const mcpToolsList = {
                 jsonrpc: "2.0", id: payload.id,
@@ -146,16 +155,14 @@ wss.on('connection', function connection(ws, req) {
             return;
         }
 
-        // 2. TOOL EXECUTION
         if (payload.method === "tools/call") {
             console.log(`\n⚙️ [MCP PROTOCOL]: External Agent executed tool -> [${payload.params.name}]`);
             
             if (payload.params.name === "read_student_records" && activeAgent) {
                 pendingMCPRequests.set("extract_data", { ws: ws, id: payload.id });
-                activeAgent.send(JSON.stringify({ action: "extract_data", auth_token: EDGE_AGENT_TOKEN }));
+                activeAgent.send(JSON.stringify({ action: "extract_data", auth_token: activeClientToken }));
             } 
             
-            // 🏦 THE BANK VERIFICATION SIMULATOR
             else if (payload.params.name === "verify_upi_utr") {
                 const args = payload.params.arguments;
                 console.log(`🏦 [BANK API]: AI is verifying UTR ${args.utr_number} for ${args.target_name}...`);
@@ -178,7 +185,6 @@ wss.on('connection', function connection(ws, req) {
                 }
             }
             
-            // 🛡️ THE SMART STAGING LOCK INTERCEPTOR
             else if (payload.params.name === "mutate_payment_status") {
                 const args = payload.params.arguments;
                 const lockId = "LOCK_" + Date.now();
@@ -190,7 +196,7 @@ wss.on('connection', function connection(ws, req) {
                     console.log(`⚡ [AUTO-APPROVE]: Payment logging for ${args.target_name} is fully verified. Executing autonomously.`);
                     
                     activeAgent.send(JSON.stringify({ 
-                        action: "update_data", auth_token: EDGE_AGENT_TOKEN, 
+                        action: "update_data", auth_token: activeClientToken, 
                         payload: args, mcp_request_id: payload.id 
                     }));
                     
@@ -216,7 +222,6 @@ wss.on('connection', function connection(ws, req) {
                 }
             }
 
-            // ⏪ THE ROLLBACK ROUTER
             else if (payload.params.name === "revert_last_mutation") {
                 const lockId = "LOCK_REVERT_" + Date.now();
                 console.log(`🔒 [HIGH-RISK ACTION]: AI requested a database rollback. Staging for human approval.`);
@@ -254,18 +259,13 @@ wss.on('connection', function connection(ws, req) {
         const aiDecision = await generateAIResponse(pendingQuestion, cleanRecords);
         if (aiDecision.type === "text") {
             broadcastToUI("ai_reply", aiDecision.content);
-            
-            // 👇 TERMINAL VOICE ADDED HERE
             console.log("\n🤖 [GEMINI AI]: " + aiDecision.content + "\n"); 
-            
         } else if (aiDecision.type === "tool_call") {
              const lockId = "LOCK_" + Date.now();
              stagedMutations.set(lockId, { action_type: "update_data", payload: aiDecision.content, mcp_request_id: null });
              broadcastToUI("ai_action_locked", "AI attempted a database mutation. Awaiting human approval.", {
                  lockId: lockId, target: aiDecision.content.target_name, status: aiDecision.content.new_status
              });
-             
-             // 👇 TERMINAL TOOL CALL OUTPUT ADDED HERE
              console.log("\n🤖 [GEMINI TOOL CALL]: Tried to mutate database. Staged for admin approval ->", aiDecision.content, "\n");
         }
         promptWhatsApp(); 
@@ -276,7 +276,7 @@ wss.on('connection', function connection(ws, req) {
     }
   });
 
-  ws.on('close', () => { /* Cleanup activeAgent and dashboardClients if needed */ });
+  ws.on('close', () => { activeAgent = null; activeClientToken = null; });
 });
 
 // ============================================================================
@@ -284,14 +284,16 @@ wss.on('connection', function connection(ws, req) {
 // ============================================================================
 function promptWhatsApp() {
     rl.question('📱 [Simulated Parent Text] (Format: Number|Message): ', (input) => {
-        if (!activeAgent) return promptWhatsApp();
+        if (!activeAgent || !activeClientToken) return promptWhatsApp();
         const parts = input.split('|');
         const phoneNumber = parts.length > 1 ? parts[0].trim() : "UNKNOWN_NUM";
         const text = parts.length > 1 ? parts[1].trim() : parts[0].trim();
         const session = sessionManager.getOrCreateSession(phoneNumber);
         pendingQuestion = text; 
         broadcastToUI("user_msg", text); 
-        activeAgent.send(JSON.stringify({ action: "extract_data", auth_token: EDGE_AGENT_TOKEN, session_id: session.sessionId }));
+        
+        // Pass the dynamic activeClientToken to authorize the query
+        activeAgent.send(JSON.stringify({ action: "extract_data", auth_token: activeClientToken, session_id: session.sessionId }));
     });
 }
 
