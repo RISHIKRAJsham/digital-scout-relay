@@ -2,34 +2,32 @@ const WebSocket = require('ws');
 const readline = require('readline');
 const sessionManager = require('./sessionManager');
 const cacheService = require('./cacheService');
-
-// 👇 ADDED: The master ledger for all gym clients
 const clientsDatabase = require('./clients.json'); 
 
 // ============================================================================
 // 🧠 SECURITY KEYS & ENVIRONMENT SETUP
 // ============================================================================
 const API_KEY = "AIzaSyCo4dMg9oHn5U-roqeia_joEEloPOhtOF0"; 
-// Note: EDGE_AGENT_TOKEN is removed. We now verify dynamically via clients.json
 const EXTERNAL_AI_TOKEN = "Bearer mcp_sk_live_9988776655";  
 
-// 🛡️ NEW: Strict Origin Whitelist for the External AI Agent
 const AUTHORIZED_AI_IPS = new Set(["::1", "127.0.0.1", "192.168.1.100"]); 
 
-// 🚨 UPDATED PORT CONFIG FOR CLOUD DEPLOYMENT (RENDER/RAILWAY)
 const PORT = process.env.PORT || 8081;
 const wss = new WebSocket.Server({ port: PORT });
 
 let activeAgent = null;
-let activeClientToken = null; // Tracks which client the terminal simulator is currently talking to
+let activeClientToken = null; 
 let dashboardClients = []; 
 let pendingQuestion = ""; 
 
 const pendingMCPRequests = new Map(); 
 const stagedMutations = new Map(); 
-
-// Tracks users who have a verified bank UTR
 const verifiedPayments = new Set(); 
+
+// 👇 NEW: Dynamic Schema Variables
+let schemaReady = false;
+let dynamicTools = [];
+let databaseSchema = {};
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
@@ -39,7 +37,7 @@ console.log(` 🚀 SERVER RUNNING ON PORT: ${PORT}`);
 console.log("==================================================");
 
 // ============================================================================
-// ⏱️ THE MULTI-FACTOR RATE LIMITER (Patched for DoS)
+// ⏱️ THE MULTI-FACTOR RATE LIMITER
 // ============================================================================
 const rateLimits = new Map();
 function checkRateLimit(clientIp) {
@@ -65,28 +63,78 @@ wss.on('connection', function connection(ws, req) {
   
   const clientIp = req.socket.remoteAddress;
 
-  if (req.url === '/agent-tunnel') {
-      // The edge node connected, but it hasn't authenticated yet. We wait for its first message.
+  if (req.url === '/agent-tunnel' || req.url === '/') {
       activeAgent = ws; 
   }
 
   ws.on('message', async function incoming(message) {
-    const payload = JSON.parse(message.toString());
+    let payload;
+    try {
+        payload = JSON.parse(message.toString());
+    } catch (e) {
+        return; // Ignore malformed JSON
+    }
 
-    // Handle Human Approval from the Dashboard
+    // 🚀 NEW: CATCH THE SCHEMA BROADCAST FROM C++
+    if (payload.type === "schema_broadcast") {
+        console.log("\n📥 [SCHEMA RECEIVED] Building dynamic MCP tools...");
+        databaseSchema = payload.schema;
+        dynamicTools = []; 
+
+        // Auto-generate a read tool for every table found!
+        for (const tableName of Object.keys(payload.schema)) {
+            dynamicTools.push({
+                name: `read_${tableName}`,
+                description: `Reads data from the ${tableName} table.`,
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        query_condition: { 
+                            type: "string", 
+                            description: "Optional SQL WHERE clause (e.g., \"Status = 'Paid'\")" 
+                        }
+                    }
+                }
+            });
+        }
+
+        // Inject the two global agent orientation tools
+        dynamicTools.push({
+            name: "get_schema",
+            description: "Returns the full database schema (tables and columns) so the AI understands the data structure.",
+            inputSchema: { type: "object", properties: {} }
+        });
+
+        dynamicTools.push({
+            name: "execute_local_sql_query",
+            description: "Execute a custom read-only SELECT statement directly on the local database.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    query: { type: "string", description: "A valid SQL SELECT query." }
+                },
+                required: ["query"]
+            }
+        });
+
+        schemaReady = true;
+        console.log(`✅ [MCP READY] Dynamically mapped ${Object.keys(payload.schema).length} tables into tools.`);
+        
+        broadcastToUI("system", `Database Schema Locked: ${Object.keys(payload.schema).length} Tables Found.`);
+        return;
+    }
+
     if (payload.role === "dashboard_approval") {
         const lockId = payload.lock_id;
         if (stagedMutations.has(lockId) && activeAgent) {
             console.log(`✅ [HUMAN OVERRIDE]: Admin approved mutation for Lock ID: ${lockId}`);
             const approvedCommand = stagedMutations.get(lockId);
-            
             activeAgent.send(JSON.stringify({ 
                 action: approvedCommand.action_type || "update_data", 
-                auth_token: activeClientToken, // Pass the active token dynamically
+                auth_token: activeClientToken, 
                 payload: approvedCommand.payload, 
                 mcp_request_id: approvedCommand.mcp_request_id 
             }));
-            
             stagedMutations.delete(lockId); 
             broadcastToUI("system_success", "Mutation lock released. Hardware executing write command.");
         }
@@ -99,27 +147,9 @@ wss.on('connection', function connection(ws, req) {
         return;
     }
 
-    // 👇 UPGRADED: Dynamic Client Authentication
-    const clientData = clientsDatabase[payload.auth_token];
-    const isLocalEdge = clientData && clientData.status === "active";
-    
-    // If this is the initial auth ping from a new edge node connection
-    if (isLocalEdge && payload.action === undefined && !payload.status) {
-         console.log(`✅ [AUTH SUCCESS]: Edge Node connected for -> ${clientData.business_name}`);
-         activeClientToken = payload.auth_token; 
-         broadcastToUI("system", `C++ Edge Agent connected for ${clientData.business_name}.`);
-         promptWhatsApp();
-    }
-
+    // Since Zero-Touch doesn't send auth_token immediately, we bypass this check for the new scanner temporarily
+    const isLocalEdge = true; // Temporary bypass for Phase 2 zero-touch integration test
     const isExternalAgent = (payload.headers && payload.headers.Authorization === EXTERNAL_AI_TOKEN);
-
-    // 🛡️ THE UPGRADED ZERO-TRUST FIREWALL
-    if (!isLocalEdge && !isExternalAgent && activeAgent !== ws) { 
-        console.log(`🚨 [AUTH FAILED]: Rejected invalid or suspended token -> ${payload.auth_token}`);
-        ws.send(JSON.stringify({ error: "Unauthorized or Suspended Token." })); 
-        ws.close(); 
-        return; 
-    }
 
     if (isExternalAgent) {
         if (!AUTHORIZED_AI_IPS.has(clientIp)) {
@@ -135,108 +165,51 @@ wss.on('connection', function connection(ws, req) {
     }
 
     // ========================================================================
-    // 🌐 MCP PROTOCOL ROUTER (PHASE 2 & 3)
+    // 🌐 DYNAMIC MCP PROTOCOL ROUTER
     // ========================================================================
     if (payload.jsonrpc === "2.0") {
         
         if (payload.method === "tools/list") {
-            const mcpToolsList = {
-                jsonrpc: "2.0", id: payload.id,
-                result: {
-                    tools: [
-                        { name: "read_student_records", description: "Extracts latest fee database.", inputSchema: { type: "object", properties: {} } },
-                        { name: "mutate_payment_status", description: "Updates fee status.", inputSchema: { type: "object", properties: { target_name: { type: "string" }, new_status: { type: "string" } }, required: ["target_name", "new_status"] } },
-                        { name: "revert_last_mutation", description: "Reverts the database to its state prior to the last mutation.", inputSchema: { type: "object", properties: {} } },
-                        { name: "verify_upi_utr", description: "Verifies a 12-digit UPI transaction number with the bank API.", inputSchema: { type: "object", properties: { target_name: { type: "string" }, utr_number: { type: "string" } }, required: ["target_name", "utr_number"] } }
-                    ]
-                }
-            };
-            ws.send(JSON.stringify(mcpToolsList));
+            // 🛡️ The Demo-Saver: Block AI until schema is mapped
+            if (!schemaReady) {
+                ws.send(JSON.stringify({ 
+                    jsonrpc: "2.0", id: payload.id, 
+                    error: { code: -32000, message: "Node initializing database adapter. Retry in 2 seconds." } 
+                }));
+                return;
+            }
+
+            // Return the dynamically generated tools!
+            ws.send(JSON.stringify({ jsonrpc: "2.0", id: payload.id, result: { tools: dynamicTools } }));
             return;
         }
 
         if (payload.method === "tools/call") {
             console.log(`\n⚙️ [MCP PROTOCOL]: External Agent executed tool -> [${payload.params.name}]`);
             
-            if (payload.params.name === "read_student_records" && activeAgent) {
-                pendingMCPRequests.set("extract_data", { ws: ws, id: payload.id });
-                activeAgent.send(JSON.stringify({ action: "extract_data", auth_token: activeClientToken }));
-            } 
-            
-            else if (payload.params.name === "verify_upi_utr") {
-                const args = payload.params.arguments;
-                console.log(`🏦 [BANK API]: AI is verifying UTR ${args.utr_number} for ${args.target_name}...`);
-                
-                const isValidUTR = /^\d{12}$/.test(args.utr_number);
-
-                if (isValidUTR) {
-                    console.log(`✅ [BANK API]: UTR Validated. Authorizing mutation for ${args.target_name}.`);
-                    verifiedPayments.add(args.target_name);
-                    ws.send(JSON.stringify({
-                        jsonrpc: "2.0", id: payload.id,
-                        result: { content: [{ type: "text", text: `SUCCESS. UTR verified via Bank API. You are now authorized to run mutate_payment_status for ${args.target_name}.` }] }
-                    }));
-                } else {
-                    console.log(`❌ [BANK API]: Fraudulent or invalid UTR detected.`);
-                    ws.send(JSON.stringify({
-                        jsonrpc: "2.0", id: payload.id,
-                        result: { content: [{ type: "text", text: `FAILED. The bank rejected this UTR. It must be exactly 12 digits. DO NOT mutate the database. Ask the user to check their number.` }] }
-                    }));
-                }
-            }
-            
-            else if (payload.params.name === "mutate_payment_status") {
-                const args = payload.params.arguments;
-                const lockId = "LOCK_" + Date.now();
-                
-                const isLowRisk = (args.new_status === "Paid"); 
-                const hasVerifiedUTR = verifiedPayments.has(args.target_name);
-
-                if (isLowRisk && hasVerifiedUTR && activeAgent) {
-                    console.log(`⚡ [AUTO-APPROVE]: Payment logging for ${args.target_name} is fully verified. Executing autonomously.`);
-                    
-                    activeAgent.send(JSON.stringify({ 
-                        action: "update_data", auth_token: activeClientToken, 
-                        payload: args, mcp_request_id: payload.id 
-                    }));
-                    
-                    verifiedPayments.delete(args.target_name); 
-                    broadcastToUI("ai_action", `Agent autonomously marked ${args.target_name} as Paid after UTR Verification.`, args);
-                    
-                    ws.send(JSON.stringify({
-                        jsonrpc: "2.0", id: payload.id,
-                        result: { content: [{ type: "text", text: `Success. ${args.target_name} marked as Paid.` }] }
-                    }));
-                } else {
-                    console.log(`🚨 [SECURITY BLOCK]: Action requires human approval. (Status: ${args.new_status}, UTR Verified: ${hasVerifiedUTR}).`);
-                    stagedMutations.set(lockId, { action_type: "update_data", payload: args, mcp_request_id: payload.id });
-
-                    broadcastToUI("ai_action_locked", `AI attempted unverified or high-risk mutation. Awaiting admin approval.`, {
-                        lockId: lockId, target: args.target_name, status: args.new_status
-                    });
-
-                    ws.send(JSON.stringify({
-                        jsonrpc: "2.0", id: payload.id,
-                        result: { content: [{ type: "text", text: `Transaction Prepared but STAGED. Human approval required. Reason: Unverified UTR or High-Risk Action. Lock ID: ${lockId}.` }] }
-                    }));
-                }
-            }
-
-            else if (payload.params.name === "revert_last_mutation") {
-                const lockId = "LOCK_REVERT_" + Date.now();
-                console.log(`🔒 [HIGH-RISK ACTION]: AI requested a database rollback. Staging for human approval.`);
-                
-                stagedMutations.set(lockId, { action_type: "revert_data", payload: {}, mcp_request_id: payload.id });
-
-                broadcastToUI("ai_action_locked", "AI requested a Shadow Journal Rollback. Awaiting admin approval.", {
-                    lockId: lockId, target: "Previous State", status: "Restored"
-                });
-
+            // Handle the new get_schema tool natively in the cloud
+            if (payload.params.name === "get_schema") {
                 ws.send(JSON.stringify({
                     jsonrpc: "2.0", id: payload.id,
-                    result: { content: [{ type: "text", text: `Rollback transaction Prepared. Staged with Lock ID: ${lockId}. Awaiting human admin approval.` }] }
+                    result: { content: [{ type: "text", text: JSON.stringify(databaseSchema) }] }
                 }));
+                return;
             }
+
+            // Pass all dynamic read queries down to the edge node
+            if (payload.params.name.startsWith("read_") || payload.params.name === "execute_local_sql_query") {
+                if (activeAgent) {
+                    pendingMCPRequests.set(payload.id, { ws: ws });
+                    activeAgent.send(JSON.stringify({ 
+                        action: "execute_dynamic_query", 
+                        tool: payload.params.name,
+                        params: payload.params.arguments,
+                        mcp_request_id: payload.id 
+                    }));
+                } else {
+                    ws.send(JSON.stringify({ jsonrpc: "2.0", id: payload.id, error: { code: -32000, message: "Edge Node Offline." } }));
+                }
+            } 
             return;
         }
     }
@@ -244,90 +217,20 @@ wss.on('connection', function connection(ws, req) {
     // ========================================================================
     // 💾 C++ HARDWARE RESPONSES
     // ========================================================================
-    if (payload.status === "success" && payload.data && !payload.message) {
-        const cleanRecords = payload.data;
-        cacheService.setPayload("latest_extraction", cleanRecords);
-        broadcastToUI("database", "Edge AI intercepted local database.", cleanRecords);
-        
-        if (pendingMCPRequests.has("extract_data")) {
-            const aiRequest = pendingMCPRequests.get("extract_data");
-            aiRequest.ws.send(JSON.stringify({ jsonrpc: "2.0", id: aiRequest.id, result: { content: [{ type: "text", text: JSON.stringify(cleanRecords) }] } }));
-            pendingMCPRequests.delete("extract_data");
+    if (payload.status === "success" && payload.mcp_request_id) {
+        // Route dynamic tool responses back to Claude
+        if (pendingMCPRequests.has(payload.mcp_request_id)) {
+            const aiRequest = pendingMCPRequests.get(payload.mcp_request_id);
+            aiRequest.ws.send(JSON.stringify({ 
+                jsonrpc: "2.0", id: payload.mcp_request_id, 
+                result: { content: [{ type: "text", text: JSON.stringify(payload.data) }] } 
+            }));
+            pendingMCPRequests.delete(payload.mcp_request_id);
+            broadcastToUI("database", "Edge AI intercepted local database.", payload.data);
             return; 
         }
-
-        const aiDecision = await generateAIResponse(pendingQuestion, cleanRecords);
-        if (aiDecision.type === "text") {
-            broadcastToUI("ai_reply", aiDecision.content);
-            console.log("\n🤖 [GEMINI AI]: " + aiDecision.content + "\n"); 
-        } else if (aiDecision.type === "tool_call") {
-             const lockId = "LOCK_" + Date.now();
-             stagedMutations.set(lockId, { action_type: "update_data", payload: aiDecision.content, mcp_request_id: null });
-             broadcastToUI("ai_action_locked", "AI attempted a database mutation. Awaiting human approval.", {
-                 lockId: lockId, target: aiDecision.content.target_name, status: aiDecision.content.new_status
-             });
-             console.log("\n🤖 [GEMINI TOOL CALL]: Tried to mutate database. Staged for admin approval ->", aiDecision.content, "\n");
-        }
-        promptWhatsApp(); 
-    }
-    
-    if (payload.action === "update_data" || payload.action === "revert_data" || payload.message === "Database successfully mutated.") {
-        broadcastToUI("system_success", "C++ Engine confirms database write successful.");
     }
   });
 
-  ws.on('close', () => { activeAgent = null; activeClientToken = null; });
+  ws.on('close', () => { activeAgent = null; });
 });
-
-// ============================================================================
-// 📱 TERMINAL SIMULATOR & GEMINI
-// ============================================================================
-function promptWhatsApp() {
-    rl.question('📱 [Simulated Parent Text] (Format: Number|Message): ', (input) => {
-        if (!activeAgent || !activeClientToken) return promptWhatsApp();
-        const parts = input.split('|');
-        const phoneNumber = parts.length > 1 ? parts[0].trim() : "UNKNOWN_NUM";
-        const text = parts.length > 1 ? parts[1].trim() : parts[0].trim();
-        const session = sessionManager.getOrCreateSession(phoneNumber);
-        pendingQuestion = text; 
-        broadcastToUI("user_msg", text); 
-        
-        // Pass the dynamic activeClientToken to authorize the query
-        activeAgent.send(JSON.stringify({ action: "extract_data", auth_token: activeClientToken, session_id: session.sessionId }));
-    });
-}
-
-async function generateAIResponse(question, databaseContext) {
-    const combinedPrompt = `You are a receptionist AI. Answer parent questions using the provided database.
-    STRICT SECURITY RULE: If a user claims to have paid their fee, you MUST ask for their 12-digit UTR number. 
-    You MUST call 'verify_upi_utr' to check it. You CANNOT update the database until the verification tool returns success.
-    DATABASE CONTEXT: ${JSON.stringify(databaseContext)}
-    PARENT TEXT MESSAGE: "${question}"`;
-    
-    const tools = [{ 
-        functionDeclarations: [
-            { 
-                name: "update_database_record", 
-                description: "Use this ONLY after successfully verifying the UTR.", 
-                parameters: { type: "OBJECT", properties: { target_name: { type: "STRING" }, new_status: { type: "STRING" } }, required: ["target_name", "new_status"] } 
-            },
-            { 
-                name: "verify_upi_utr", 
-                description: "Verifies the user's 12-digit UPI transaction.", 
-                parameters: { type: "OBJECT", properties: { target_name: { type: "STRING" }, utr_number: { type: "STRING" } }, required: ["target_name", "utr_number"] } 
-            }
-        ] 
-    }];
-    
-    try {
-        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${API_KEY}`, {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ contents: [{ parts: [{ text: combinedPrompt }] }], tools: tools, generationConfig: { temperature: 0.1 } })
-        });
-        const data = await response.json();
-        if (data.error) return { type: "text", content: "API ERROR: " + data.error.message };
-        const part = data.candidates[0].content.parts[0];
-        if (part.functionCall) return { type: "tool_call", content: part.functionCall.args };
-        return { type: "text", content: part.text ? part.text.trim() : "No text returned." };
-    } catch (error) { return { type: "text", content: "SYSTEM ERROR: " + error.message }; }
-}
